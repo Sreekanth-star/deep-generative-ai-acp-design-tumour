@@ -1,1 +1,1026 @@
+# ======================================================================
+# DEEP GENERATIVE AI MODEL FOR ACPs AGAINST SPECIFIC TUMOURS
+# DATA COLLECTION AND PREPROCESSING PIPELINE
+# ======================================================================
+#
+# Stage 01 : TumorHoPe 2.0 API data collection
+# Stage 02 : Remove records without tumor markers
+# Stage 03 : Separate carbohydrate / sugar / glycan markers
+# Stage 04 : Tumor marker → Gene Symbol mapping
+# Stage 05 : Gene Symbol → UniProt ID mapping
+# Stage 06 : Retrieve target protein sequences
+# Stage 07 : Retrieve tumor-marker protein sequences
+# Stage 08 : ACP–target sequence duplicate audit
+# Stage 09 : Split multiple cancer types
+# Stage 10 : Exact duplicate audit
+# Stage 11 : Remove exact duplicates and generate final dataset
+#
+# NOTE:
+# - Raw data are preserved.
+# - Audit stages do not delete records.
+# - Gene symbols are manually mapped.
+# ======================================================================
 
+
+# ======================================================================
+# STAGE 01: TUMORHOPE 2.0 API DATA COLLECTION
+# ======================================================================
+
+import requests
+import pandas as pd
+import json
+import time
+from pathlib import Path
+
+BASE_URL = (
+    "https://webs.iiitd.edu.in/raghava/"
+    "tumorhope2/restapi/api.php"
+)
+
+TUMOR_CATEGORIES = [
+    "Lung cancer",
+    "Colon cancer",
+    "Breast cancer",
+    "Esophagus cancer",
+    "Sarcoma",
+    "Brain tumor",
+    "Colorectal cancer",
+    "Angiogenic tumors",
+    "Melanoma",
+    "Prostate cancer",
+    "Gastric cancer",
+    "Pancreatic cancer",
+    "Leukemia",
+    "Ovarian cancer",
+    "Liver cancer",
+    "Bladder cancer",
+    "Skin cancer",
+    "Glioblastoma",
+    "Cervical cancer",
+    "Retinoblastoma",
+    "Endometrial adenocarcinoma",
+    "Cardiac cancer",
+    "Renal cell carcinoma",
+    "Hepatocellular carcinoma"
+]
+
+OUTPUT_DIR = Path("/content/TumorHoPe2_Raw")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+all_records = []
+query_summary = []
+
+print("=" * 70)
+print("STAGE 01: TUMORHOPE 2.0 DATA COLLECTION")
+print("=" * 70)
+
+for tumor in TUMOR_CATEGORIES:
+
+    try:
+        response = requests.get(
+            BASE_URL,
+            params={"target_tumor": tumor},
+            headers={"Accept": "application/json"},
+            timeout=60
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+        records = data.get("results", [])
+
+        all_records.extend(records)
+
+        query_summary.append({
+            "Tumor_Query": tumor,
+            "API_Status": data.get("status"),
+            "API_Count": data.get("count", 0),
+            "Records_Retrieved": len(records)
+        })
+
+        print(
+            f"{tumor:<30} -> "
+            f"{len(records):>5} records"
+        )
+
+        time.sleep(0.2)
+
+    except Exception as e:
+
+        query_summary.append({
+            "Tumor_Query": tumor,
+            "API_Status": "ERROR",
+            "API_Count": 0,
+            "Records_Retrieved": 0
+        })
+
+        print(f"{tumor:<30} -> ERROR: {e}")
+
+raw_df = pd.DataFrame(all_records)
+summary_df = pd.DataFrame(query_summary)
+
+RAW_CSV = (
+    OUTPUT_DIR /
+    "TumorHoPe2_RAW_API_24_Tumor_Categories.csv"
+)
+
+RAW_JSON = (
+    OUTPUT_DIR /
+    "TumorHoPe2_RAW_API_24_Tumor_Categories.json"
+)
+
+SUMMARY_CSV = (
+    OUTPUT_DIR /
+    "TumorHoPe2_API_Query_Summary.csv"
+)
+
+raw_df.to_csv(RAW_CSV, index=False)
+
+with open(RAW_JSON, "w", encoding="utf-8") as f:
+    json.dump(
+        all_records,
+        f,
+        ensure_ascii=False,
+        indent=2
+    )
+
+summary_df.to_csv(SUMMARY_CSV, index=False)
+
+print("\nTotal raw records:", len(raw_df))
+print("Raw dataset saved:", RAW_CSV)
+
+
+# ======================================================================
+# STAGE 02: REMOVE RECORDS WITHOUT TUMOR MARKER
+# ======================================================================
+
+import pandas as pd
+
+INPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "TumorHoPe2_RAW_API_24_Tumor_Categories.csv"
+)
+
+OUTPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "TumorHoPe2_RAW_With_Tumor_Markers.csv"
+)
+
+REMOVED_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "TumorHoPe2_RAW_Without_Tumor_Markers.csv"
+)
+
+df = pd.read_csv(INPUT_FILE, dtype=str)
+
+print("\n" + "=" * 70)
+print("STAGE 02: REMOVE RECORDS WITHOUT TUMOR MARKERS")
+print("=" * 70)
+
+marker = (
+    df["receptors_biomarker"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+MISSING_MARKERS = {
+    "",
+    "NA",
+    "N/A",
+    "na",
+    "n/a",
+    "None",
+    "none",
+    "null",
+    "NULL",
+    "Not available",
+    "Not Available",
+    "Unknown",
+    "unknown"
+}
+
+has_marker = ~marker.isin(MISSING_MARKERS)
+
+df_with_marker = df.loc[has_marker].copy()
+df_without_marker = df.loc[~has_marker].copy()
+
+assert (
+    len(df_with_marker) +
+    len(df_without_marker)
+    == len(df)
+)
+
+df_with_marker.to_csv(
+    OUTPUT_FILE,
+    index=False
+)
+
+df_without_marker.to_csv(
+    REMOVED_FILE,
+    index=False
+)
+
+print("Original records:", len(df))
+print("Records with marker:", len(df_with_marker))
+print("Records without marker:", len(df_without_marker))
+print("Stage 02 completed.")
+
+
+# ======================================================================
+# STAGE 03: SEPARATE CARBOHYDRATE / SUGAR / GLYCAN MARKERS
+# ======================================================================
+
+import pandas as pd
+import os
+
+INPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "TumorHoPe2_RAW_With_Tumor_Markers.csv"
+)
+
+OUTPUT_DIR = "/content/TumorHoPe2_Raw"
+
+df = pd.read_csv(INPUT_FILE, dtype=str)
+
+print("\n" + "=" * 70)
+print("STAGE 03: CARBOHYDRATE / GLYCAN SEPARATION")
+print("=" * 70)
+
+marker_col = "receptors_biomarker"
+
+marker_text = (
+    df[marker_col]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .str.lower()
+)
+
+carbohydrate_keywords = [
+    "gal beta",
+    "galnac",
+    "galactose",
+    "mannose",
+    "sugar",
+    "carbohydrate",
+    "glycan",
+    "glycosaminoglycan",
+    "gag",
+    "heparan sulfate",
+    "sulfated gag",
+    "hspg",
+    "proteoglycan",
+    "syndecan",
+    "glypican"
+]
+
+is_carbohydrate = marker_text.apply(
+    lambda x: any(
+        keyword in x
+        for keyword in carbohydrate_keywords
+    )
+)
+
+# CD206 is a protein receptor, not a carbohydrate target.
+protein_receptor_exceptions = [
+    "cd206 (mannose receptor)",
+    "mannose receptor"
+]
+
+for exception in protein_receptor_exceptions:
+    is_carbohydrate &= ~marker_text.eq(exception)
+
+df_carbohydrate = df[is_carbohydrate].copy()
+df_main = df[~is_carbohydrate].copy()
+
+assert (
+    len(df_main) +
+    len(df_carbohydrate)
+    == len(df)
+)
+
+MAIN_FILE = (
+    OUTPUT_DIR +
+    "/TumorHoPe2_RAW_Protein_Other_Tumor_Markers.csv"
+)
+
+CARB_FILE = (
+    OUTPUT_DIR +
+    "/TumorHoPe2_Carbohydrate_Sugar_Glycan_Markers.csv"
+)
+
+df_main.to_csv(MAIN_FILE, index=False)
+df_carbohydrate.to_csv(CARB_FILE, index=False)
+
+print("Input records:", len(df))
+print("Main protein/other records:", len(df_main))
+print("Carbohydrate/glycan records:", len(df_carbohydrate))
+print("Stage 03 completed.")
+
+
+# ======================================================================
+# STAGE 04: TUMOR MARKER → GENE SYMBOL MAPPING
+# ======================================================================
+#
+# Gene symbols are manually assigned based on the biological identity
+# of the tumor marker. Original tumor-marker text is retained.
+# ======================================================================
+
+import pandas as pd
+import numpy as np
+import re
+from pathlib import Path
+
+INPUT_FILE = Path(
+    "/content/TumorHoPe2_Raw/"
+    "TumorHoPe2_RAW_Protein_Other_Tumor_Markers.csv"
+)
+
+OUTPUT_DIR = Path("/content/TumorHoPe2_Raw")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+OUTPUT_FILE = (
+    OUTPUT_DIR /
+    "TumorHoPe2_STAGE04_ACP_Target_Gene_Expanded.csv"
+)
+
+df = pd.read_csv(
+    INPUT_FILE,
+    dtype=str,
+    keep_default_na=False
+)
+
+print("\n" + "=" * 70)
+print("STAGE 04: TUMOR MARKER → GENE SYMBOL MAPPING")
+print("=" * 70)
+
+df["_Original_Record_Number"] = np.arange(
+    1,
+    len(df) + 1
+)
+
+def normalize_marker(value):
+
+    value = str(value).strip()
+
+    value = value.replace("α", "alpha")
+    value = value.replace("β", "beta")
+
+    value = value.replace("–", "-")
+    value = value.replace("—", "-")
+    value = value.replace("−", "-")
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    )
+
+    return value.lower().strip()
+
+
+# Add all manually curated marker → gene mappings here.
+# Multiple genes are represented as a list.
+
+GENE_MAP = {
+
+    "avb3 integrin": ["ITGAV", "ITGB3"],
+    "alpha-v-beta-3 integrin": ["ITGAV", "ITGB3"],
+    "alpha v beta 3 integrin": ["ITGAV", "ITGB3"],
+    "integrin avb3": ["ITGAV", "ITGB3"],
+
+    "avb5 integrin": ["ITGAV", "ITGB5"],
+    "alpha-v-beta-5 integrin": ["ITGAV", "ITGB5"],
+
+    "alpha-5 beta-1 integrin": ["ITGA5", "ITGB1"],
+    "alpha 5 beta 1 integrin": ["ITGA5", "ITGB1"],
+
+    "alpha 3 beta 1": ["ITGA3", "ITGB1"],
+    "alpha3beta1": ["ITGA3", "ITGB1"],
+
+    "neuropilin-1": ["NRP1"],
+    "neuropilin 1": ["NRP1"],
+    "nrp1": ["NRP1"],
+
+    "neuropilin-2": ["NRP2"],
+    "neuropilin 2": ["NRP2"],
+    "nrp2": ["NRP2"],
+
+    "egfr": ["EGFR"],
+
+    "her2": ["ERBB2"],
+    "her-2": ["ERBB2"],
+    "erbb2": ["ERBB2"],
+
+    "cxcr4": ["CXCR4"],
+
+    "psma": ["FOLH1"],
+
+    "annexin 1": ["ANXA1"],
+    "anxa1": ["ANXA1"],
+
+    "p32": ["C1QBP"],
+    "p32 protein": ["C1QBP"],
+
+    "aminopeptidase n": ["ANPEP"],
+    "cd13": ["ANPEP"],
+
+    "epha2": ["EPHA2"],
+
+    "il-13ra2": ["IL13RA2"],
+    "il4r": ["IL4R"],
+
+    "mertk": ["MERTK"],
+
+    "braf v600e": ["BRAF"],
+
+    "tnfrsf19l": ["TNFRSF19"],
+
+    "lhrh": ["GNRHR"],
+
+    "gastrin-releasing peptide receptor": ["GRPR"]
+}
+
+
+def map_genes(marker):
+
+    normalized = normalize_marker(marker)
+
+    return GENE_MAP.get(
+        normalized,
+        []
+    )
+
+
+df["Normalized_Marker"] = (
+    df["receptors_biomarker"]
+    .apply(normalize_marker)
+)
+
+df["Gene_Symbol"] = (
+    df["Normalized_Marker"]
+    .apply(map_genes)
+)
+
+# Expand records when a marker corresponds to multiple genes.
+df = df.explode(
+    "Gene_Symbol",
+    ignore_index=True
+)
+
+df["Gene_Symbol"] = (
+    df["Gene_Symbol"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+df.to_csv(
+    OUTPUT_FILE,
+    index=False
+)
+
+print("Original records:", len(
+    pd.read_csv(INPUT_FILE, dtype=str)
+))
+
+print("Expanded records:", len(df))
+print("Unmapped records:",
+      (df["Gene_Symbol"] == "").sum())
+
+print("Output:", OUTPUT_FILE)
+print("Stage 04 completed.")
+
+
+# ======================================================================
+# STAGE 05: GENE SYMBOL → UNIPROT ID
+# ======================================================================
+#
+# UniProt IDs are associated with the manually assigned gene symbols.
+# The selected UniProt ID should correspond to the appropriate target
+# protein and organism used in the study.
+# ======================================================================
+
+import pandas as pd
+from pathlib import Path
+
+INPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "TumorHoPe2_STAGE04_ACP_Target_Gene_Expanded.csv"
+)
+
+OUTPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "ACP_gene_uniprot_expanded.csv"
+)
+
+df = pd.read_csv(
+    INPUT_FILE,
+    dtype=str
+)
+
+print("\n" + "=" * 70)
+print("STAGE 05: GENE SYMBOL → UNIPROT ID")
+print("=" * 70)
+
+# Add your manually curated Gene Symbol → UniProt mapping here.
+# Example:
+#
+# UNIPROT_MAP = {
+#     "EGFR": "P00533",
+#     "ERBB2": "P04626",
+#     "ITGAV": "P06756",
+#     "ITGB3": "P05106"
+# }
+
+UNIPROT_MAP = {
+    # Add verified mappings here.
+}
+
+df["UniProt_ID"] = (
+    df["Gene_Symbol"]
+    .str.upper()
+    .map(UNIPROT_MAP)
+)
+
+df.to_csv(
+    OUTPUT_FILE,
+    index=False
+)
+
+print("Records:", len(df))
+print(
+    "Mapped UniProt IDs:",
+    df["UniProt_ID"].notna().sum()
+)
+
+print(
+    "Unmapped UniProt IDs:",
+    df["UniProt_ID"].isna().sum()
+)
+
+print("Output:", OUTPUT_FILE)
+print("Stage 05 completed.")
+
+
+# ======================================================================
+# STAGE 06: TARGET PROTEIN SEQUENCE RETRIEVAL
+# ======================================================================
+
+import pandas as pd
+import requests
+import time
+
+INPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "ACP_gene_uniprot_expanded.csv"
+)
+
+OUTPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "ACP_gene_uniprot_protein_sequences.csv"
+)
+
+df = pd.read_csv(
+    INPUT_FILE,
+    dtype=str
+)
+
+print("\n" + "=" * 70)
+print("STAGE 06: TARGET PROTEIN SEQUENCE RETRIEVAL")
+print("=" * 70)
+
+df["UniProt_ID"] = (
+    df["UniProt_ID"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+df["UniProt_ID"] = (
+    df["UniProt_ID"]
+    .str.replace("(", "", regex=False)
+    .str.replace(")", "", regex=False)
+)
+
+unique_ids = (
+    df["UniProt_ID"]
+    .loc[lambda x: x != ""]
+    .drop_duplicates()
+    .tolist()
+)
+
+
+def get_protein(uniprot_id):
+
+    url = (
+        "https://rest.uniprot.org/"
+        f"uniprotkb/{uniprot_id}.json"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            timeout=30
+        )
+
+        if response.status_code != 200:
+
+            return {
+                "Protein_Name": pd.NA,
+                "Verified_Gene": pd.NA,
+                "Organism": pd.NA,
+                "Protein_Sequence": pd.NA,
+                "Protein_Length": pd.NA,
+                "Sequence_Status":
+                    f"HTTP {response.status_code}"
+            }
+
+        data = response.json()
+
+        protein_name = (
+            data.get(
+                "proteinDescription",
+                {}
+            )
+            .get(
+                "recommendedName",
+                {}
+            )
+            .get(
+                "fullName",
+                {}
+            )
+            .get("value")
+        )
+
+        genes = data.get(
+            "genes",
+            []
+        )
+
+        verified_gene = pd.NA
+
+        if genes:
+            verified_gene = (
+                genes[0]
+                .get(
+                    "geneName",
+                    {}
+                )
+                .get("value")
+            )
+
+        organism = (
+            data.get(
+                "organism",
+                {}
+            )
+            .get("scientificName")
+        )
+
+        sequence = (
+            data.get(
+                "sequence",
+                {}
+            )
+            .get("value")
+        )
+
+        length = (
+            data.get(
+                "sequence",
+                {}
+            )
+            .get("length")
+        )
+
+        return {
+            "Protein_Name": protein_name,
+            "Verified_Gene": verified_gene,
+            "Organism": organism,
+            "Protein_Sequence": sequence,
+            "Protein_Length": length,
+            "Sequence_Status":
+                "Available"
+                if sequence
+                else "Sequence unavailable"
+        }
+
+    except Exception as e:
+
+        return {
+            "Protein_Name": pd.NA,
+            "Verified_Gene": pd.NA,
+            "Organism": pd.NA,
+            "Protein_Sequence": pd.NA,
+            "Protein_Length": pd.NA,
+            "Sequence_Status":
+                f"ERROR: {e}"
+        }
+
+
+records = []
+
+for i, uniprot_id in enumerate(
+    unique_ids,
+    start=1
+):
+
+    result = get_protein(
+        uniprot_id
+    )
+
+    records.append({
+        "UniProt_ID": uniprot_id,
+        **result
+    })
+
+    print(
+        f"{i}/{len(unique_ids)} "
+        f"{uniprot_id} -> "
+        f"{result['Sequence_Status']}"
+    )
+
+    time.sleep(0.1)
+
+protein_df = pd.DataFrame(
+    records
+)
+
+df_final = df.merge(
+    protein_df,
+    on="UniProt_ID",
+    how="left",
+    validate="many_to_one"
+)
+
+df_final["Gene_Verification"] = "Not checked"
+
+mask = (
+    df_final["Gene_Symbol"].notna()
+    &
+    df_final["Verified_Gene"].notna()
+)
+
+df_final.loc[
+    mask,
+    "Gene_Verification"
+] = (
+    df_final.loc[mask, "Gene_Symbol"]
+    .str.upper()
+    ==
+    df_final.loc[mask, "Verified_Gene"]
+    .str.upper()
+).map({
+    True: "MATCH",
+    False: "MISMATCH"
+})
+
+df_final["Organism_Status"] = "Unknown"
+
+mask = df_final["Organism"].notna()
+
+df_final.loc[
+    mask,
+    "Organism_Status"
+] = (
+    df_final.loc[mask, "Organism"]
+    .str.lower()
+    .eq("homo sapiens")
+).map({
+    True: "HUMAN",
+    False: "NON-HUMAN"
+})
+
+df_final.to_csv(
+    OUTPUT_FILE,
+    index=False
+)
+
+print("Original records:", len(df))
+print("Final records:", len(df_final))
+print("Output:", OUTPUT_FILE)
+print("Stage 06 completed.")
+
+
+# ======================================================================
+# STAGE 07: TUMOR-MARKER PROTEIN SEQUENCE RETRIEVAL
+# ======================================================================
+
+import pandas as pd
+import requests
+import time
+
+INPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "ACP_gene_uniprot_protein_sequences.csv"
+)
+
+OUTPUT_FILE = (
+    "/content/TumorHoPe2_Raw/"
+    "ACP_TumorMarker_UniProt_Protein_Sequences.csv"
+)
+
+df = pd.read_csv(
+    INPUT_FILE,
+    dtype=str
+)
+
+print("\n" + "=" * 70)
+print("STAGE 07: TUMOR-MARKER PROTEIN SEQUENCE RETRIEVAL")
+print("=" * 70)
+
+df["UniProt_ID"] = (
+    df["UniProt_ID"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+invalid = [
+    "",
+    "NAN",
+    "NONE",
+    "NA",
+    "<NA>"
+]
+
+df.loc[
+    df["UniProt_ID"].isin(invalid),
+    "UniProt_ID"
+] = pd.NA
+
+unique_ids = (
+    df["UniProt_ID"]
+    .dropna()
+    .drop_duplicates()
+    .tolist()
+)
+
+sequence_cache = {}
+protein_name_cache = {}
+organism_cache = {}
+api_status_cache = {}
+
+
+def get_uniprot_entry(uniprot_id):
+
+    url = (
+        "https://rest.uniprot.org/"
+        f"uniprotkb/{uniprot_id}.json"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            timeout=30,
+            headers={
+                "Accept": "application/json"
+            }
+        )
+
+        if response.status_code != 200:
+            return None
+
+        return response.json()
+
+    except Exception:
+        return None
+
+
+for i, uniprot_id in enumerate(
+    unique_ids,
+    start=1
+):
+
+    print(
+        f"{i}/{len(unique_ids)} "
+        f"{uniprot_id} -> ",
+        end=""
+    )
+
+    data = get_uniprot_entry(
+        uniprot_id
+    )
+
+    if data is None:
+
+        api_status_cache[
+            uniprot_id
+        ] = "API_FAILED"
+
+        print("FAILED")
+        continue
+
+    sequence = (
+        data.get(
+            "sequence",
+            {}
+        )
+        .get("value")
+    )
+
+    protein_name = (
+        data.get(
+            "proteinDescription",
+            {}
+        )
+        .get(
+            "recommendedName",
+            {}
+        )
+        .get(
+            "fullName",
+            {}
+        )
+        .get("value")
+    )
+
+    organism = (
+        data.get(
+            "organism",
+            {}
+        )
+        .get("scientificName")
+    )
+
+    sequence_cache[
+        uniprot_id
+    ] = sequence
+
+    protein_name_cache[
+        uniprot_id
+    ] = protein_name
+
+    organism_cache[
+        uniprot_id
+    ] = organism
+
+    api_status_cache[
+        uniprot_id
+    ] = (
+        "AVAILABLE"
+        if sequence
+        else "NO_SEQUENCE"
+    )
+
+    print(
+        "Available"
+        if sequence
+        else "No sequence"
+    )
+
+    time.sleep(0.1)
+
+
+df["Tumor_Marker_Protein_Sequence"] = (
+    df["UniProt_ID"]
+    .map(sequence_cache)
+)
+
+df["UniProt_Protein_Name"] = (
+    df["UniProt_ID"]
+    .map(protein_name_cache)
+)
+
+df["UniProt_Organism"] = (
+    df["UniProt_ID"]
+    .map(organism_cache)
+)
+
+df["UniProt_API_Status"] = (
+    df["UniProt_ID"]
+    .map(api_status_cache)
+)
+
+df["Tumor_Marker_Protein_Length"] = (
+    df["Tumor_Marker_Protein_Sequence"]
+    .fillna("")
+    .str.len()
+)
+
+df["Tumor_Marker_Sequence_Status"] = "Missing"
+
+df.loc[
+    df["Tumor_Marker_Protein_Sequence"]
+    .fillna("")
+    .str.len()
+    > 0,
+    "Tumor_Marker_Sequence_Status"
+] = "Available"
+
+df["Tumor_Marker_Organism_Status"] = "Unknown"
+
+df.loc[
+    df["UniProt_Organism"]
+    .fillna("")
+    .str.lower()
+    .eq("homo sapiens"),
+    "Tumor_Marker_Organism_Status"
+] = "HUMAN"
